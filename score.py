@@ -44,12 +44,12 @@ class Batch(NamedTuple):
 def preprocess(shard: pl.DataFrame):
     return (
         shard.with_columns(pl.col("tag_string").str.split(" ").alias("tags"))
-        .with_columns(pl.col("rating").cast(pl.Categorical).cast(int))
-        .with_columns(pl.col("is_deleted") == "t")
+        .with_columns(pl.col("rating").cast(pl.Categorical).cast(pl.Int8))
+        .with_columns((pl.col("is_deleted") == "t").cast(float))
         .with_columns(pl.col("tags").arr.lengths().alias("tag_count"))
         .with_columns(pl.col("created_at").fill_null(strategy="backward"))
         .with_columns(
-            (pl.col("created_at") - pl.date(2007, 2, 10)).dt.days().alias("age")
+            ((pl.col("created_at") - pl.date(2007, 2, 10)).dt.days() / 365).alias("age")
         )
     )
 
@@ -69,9 +69,9 @@ def shard_batch(shard: pl.DataFrame, topk: int):
         .select(Batch._fields)
     )
     tag_ids = np.zeros([len(shard), topk], dtype=np.int32)
-    for j, row in enumerate(shard["id_tag"].to_numpy()):
+    for j, row in enumerate(shard["id_tag"]):
         tag_ids[j, : min(len(row), topk)] = row
-    return Batch(*shard.to_numpy().swapaxes(-1, 0)[:-1].astype(float), tag_ids)
+    return Batch(*shard.drop("id_tag").to_numpy().T.astype(float), tag_ids)
 
 
 class DCN(hk.Module):
@@ -104,6 +104,7 @@ def regressor(batch: Batch, dropout=0.1):
     index = batch.id_tag
     z = jnp.zeros(batch.id_tag.shape[:-1] + (embed.embed_dim,))
     for _ in range(4):
+        "https://arxiv.org/abs/1706.03993"
         "https://explosion.ai/blog/bloom-embeddings"
         index = mueller_hash(index)
         z += embed(index % embed.vocab_size).mean(axis=-2)
@@ -264,7 +265,7 @@ with rp.Progress(*columns, console=console, redirect_stdout=False) as pbar:
     for shard in shards:
         batch = shard_batch(shard, tag_count)
         score = jax.device_get(jax.jit(forward.apply)(params, stddev, batch))
-        shard = shard.with_column(pl.Series(score).alias("fav_score"))
+        shard = shard.with_columns(pl.Series(score).alias("fav_score"))
         shard = shard.select(header)
         shard.write_csv(sys.stdout.buffer, has_header=False)
         pbar.advance(task)
