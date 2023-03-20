@@ -1,0 +1,7 @@
+msgpack
+msgpack-numpy
+dm-haiku
+jax
+optax
+rich
+polars
