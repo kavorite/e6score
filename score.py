@@ -2,7 +2,7 @@ import functools as ft
 import itertools as it
 import os
 import sys
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import msgpack
 import msgpack_numpy
@@ -46,15 +46,10 @@ def preprocess(shard: pl.DataFrame):
         shard.with_columns(pl.col("tag_string").str.split(" ").alias("tags"))
         .with_columns(pl.col("rating").cast(pl.Categorical).cast(pl.Int8))
         .with_columns((pl.col("is_deleted") == "t").cast(float))
-        .with_columns(pl.col("tags").arr.lengths().alias("tag_count"))
-        .with_columns(pl.col("created_at").fill_null(strategy="backward"))
-        .with_columns(
-            ((pl.col("created_at") - pl.date(2007, 2, 10)).dt.days() / 365).alias("age")
-        )
     )
 
 
-def shard_batch(shard: pl.DataFrame, topk: int):
+def shard_batch(shard: pl.DataFrame, topk: int, seed: Optional[int] = None):
     shard = preprocess(shard).select(["tags", "id", *Batch._fields[:-1]])
     joint = (
         shard.select(["tags", "id"])
@@ -68,6 +63,8 @@ def shard_batch(shard: pl.DataFrame, topk: int):
         .with_columns(pl.col("age").fill_null(strategy="forward"))
         .select(Batch._fields)
     )
+    if seed is not None:
+        shard = shard.sample(len(shard), shuffle=True, seed=seed)
     tag_ids = np.zeros([len(shard), topk], dtype=np.int32)
     for j, row in enumerate(shard["id_tag"]):
         tag_ids[j, : min(len(row), topk)] = row
@@ -84,7 +81,9 @@ class DCN(hk.Module):
     def __call__(self, x):
         y = x
         for d in self.ranks:
-            y += x * hk.Linear(x.shape[-1])(hk.Linear(d)(y))
+            U = hk.Linear(d)
+            Vt = hk.Linear(x.shape[-1])
+            y += x * Vt(U(y))
         return y
 
 
@@ -106,8 +105,8 @@ def regressor(batch: Batch, dropout=0.1):
     for _ in range(4):
         "https://arxiv.org/abs/1706.03993"
         "https://explosion.ai/blog/bloom-embeddings"
-        index = mueller_hash(index)
-        z += embed(index % embed.vocab_size).mean(axis=-2)
+        index += embed.vocab_size
+        z += embed(mueller_hash(index % embed.vocab_size)).mean(axis=-2)
     x = [
         batch.age,
         batch.tag_count,
@@ -121,26 +120,41 @@ def regressor(batch: Batch, dropout=0.1):
     r = jax.nn.one_hot(batch.rating, 3)
     x = jnp.concatenate([x, r], axis=-1).astype(float)
     x = hk.LayerNorm(-1, True, True)(x)
-
+    h = x + hk.LayerNorm(-1, True, True, scale_init=jnp.zeros)(DCN([16] * 4)(x))
     "https://arxiv.org/abs/1907.05321"
     t = jnp.sin(hk.Linear(width)(batch.age[..., None].astype(float)))
 
     h = jnp.concatenate([z, x, t], axis=-1)
     h = hk.dropout(next(rng), dropout, h) if rng is not None else h
-    h = DCN([16] * 4)(hk.LayerNorm(-1, True, True)(h))
-    y = hk.nets.MLP([width, 512, 384, 96, 2], activation=jax.nn.gelu)(
+    y = hk.nets.MLP([512, 1024, 512, 2], activation=jax.nn.gelu)(
         h,
         dropout_rate=dropout if rng is not None else None,
         rng=next(rng) if rng is not None else None,
     )
-    shift, scale = y.swapaxes(0, -1)
-    return map(jax.nn.softplus, (shift, scale))
+    shift, scale = map(jax.nn.softplus, y.swapaxes(0, -1))
+    return shift, scale
 
 
 @hk.transform
 def gaussian_nll(batch: Batch):
     shift, scale = regressor(batch)
     return -jnp.mean(jax.scipy.stats.norm.logpdf(batch.fav_count, shift, scale))
+
+
+@hk.transform
+def residual_err(batch: Batch):
+    shift, scale = regressor(batch)
+    del scale
+    return jnp.mean(jnp.abs(batch.fav_count - shift))
+
+
+@hk.transform
+def quantile_err(batch: Batch, q=0.32):
+    "https://hackmd.io/@cgarciae/quantile-regression"
+    shift, scale = regressor(batch)
+    del scale
+    r = batch.fav_count - shift
+    return jnp.maximum(q * r, (q - 1.0) * r).mean()
 
 
 class EMA(NamedTuple):
@@ -161,16 +175,17 @@ class EMA(NamedTuple):
 
 
 def optimizer(tsteps, rng, batch):
-    del rng, batch  # needed for SAM, but otherwise unnecessary
-    lsched = optax.linear_onecycle_schedule(tsteps, 1e-5)
+    del rng, batch  # needed for SAM ascent step, but otherwise unnecessary
+    lsched = optax.linear_onecycle_schedule(tsteps, 3e-5)
     msched = optax.linear_onecycle_schedule(
         tsteps, 0.95, div_factor=0.95 / 0.85, final_div_factor=1
     )
     optim = optax.chain(
-        optax.inject_hyperparams(optax.trace)(msched),
+        optax.adaptive_grad_clip(1e-3),
+        optax.inject_hyperparams(optax.scale_by_lion)(msched),
+        optax.additive_weight_decay(0.3),
         optax.inject_hyperparams(optax.scale)(lsched),
         optax.scale(-1),
-        optax.clip_by_block_rms(0.01),
     )
     return optax.lookahead(optim, 6, 0.5)
 
@@ -188,9 +203,18 @@ def train_init(steps: int, rng: jrd.PRNGKey, batch: Batch):
     return TrainState(params, opt_st, loss=EMA.init(0.9))
 
 
+objective = gaussian_nll
+
+
 @ft.partial(jax.jit, static_argnums=0)
 def train_step(steps, state: TrainState, rng: jrd.PRNGKey, batch: Batch):
-    loss, grad = jax.value_and_grad(gaussian_nll.apply)(state.params.fast, rng, batch)
+    grad = jax.grad(objective.apply)(state.params.fast, rng, batch)
+    "https://arxiv.org/abs/2102.11600"
+    ascent_stride = 1.0 / optax.global_norm(grad)
+    params = jax.tree_util.tree_map(
+        lambda w, dw: w + jnp.square(w) * dw * ascent_stride, state.params.fast, grad
+    )
+    loss, grad = jax.value_and_grad(objective.apply)(params, rng, batch)
     updates, opt_st = optimizer(steps, rng, batch).update(
         grad, state.opt_st, state.params
     )
@@ -205,17 +229,32 @@ keys = hk.PRNGSequence(42)
 batch_size = 4096
 tag_count = 128
 sys.stderr.write(f"read {post_path}...\n")
-posts = pl.read_csv(post_path, try_parse_dates=True, low_memory=True)
+posts = (
+    pl.scan_csv(post_path, try_parse_dates=True, low_memory=True)
+    .filter(pl.col("is_deleted") == "f")
+    .with_columns(pl.col("created_at").fill_null(strategy="backward"))
+    .with_columns(
+        ((pl.col("created_at") - pl.date(2007, 2, 10)).dt.hours())
+        .cast(float)
+        .alias("age")
+    )
+    .with_columns(
+        (pl.col("tag_string").str.count_match(" ") + 1).cast(float).alias("tag_count")
+    )
+    .with_columns(pl.col("fav_count").cast(float))
+    .with_columns(
+        (pl.col(pl.FLOAT_DTYPES) - pl.col(pl.FLOAT_DTYPES).median())
+        / pl.col(pl.FLOAT_DTYPES).std()
+    )
+    .collect()
+)
 epochs = 1.0
-tsteps = int(epochs * len(posts) / batch_size + 0.5)  # bootleg ceil()
-breaks = np.arange(0, len(posts) // batch_size)
-train_shards = (
-    posts.slice(i * batch_size, batch_size)
-    for i in jax.jit(jrd.permutation, backend="cpu")(next(keys), breaks)
+tsteps = np.ceil(epochs * len(posts) / batch_size).astype(int)
+breaks = np.arange(tsteps)
+batches = (
+    shard_batch(posts.sample(batch_size, seed=seed), tag_count) for seed in it.count()
 )
-batches = it.islice(
-    it.cycle(shard_batch(shard, tag_count) for shard in train_shards), tsteps
-)
+batches = it.islice(batches, tsteps)
 columns = (
     *rp.Progress.get_default_columns()[:-2],
     rp.MofNCompleteColumn(),
@@ -250,8 +289,13 @@ else:
 def forward(stddev: float, inputs: Batch):
     value = inputs.fav_count
     shift, scale = regressor(inputs)
-    score = (value / stddev + shift / scale) / (1 / stddev + 1 / scale)
-    # score = 1 - jax.scipy.stats.norm.cdf(value, shift, scale)
+    # score = (value / stddev + shift / scale) / (1 / stddev + 1 / scale)
+    del stddev
+    if objective is gaussian_nll:
+        score = jax.scipy.stats.norm.cdf(value, shift, scale)
+    else:
+        del scale
+        score = value - shift
     return score
 
 
@@ -260,9 +304,7 @@ stddev = posts["fav_count"].std()
 sys.stdout.buffer.write((",".join(header) + "\n").encode("utf8"))
 with rp.Progress(*columns, console=console, redirect_stdout=False) as pbar:
     task = pbar.add_task("evaluating...", total=int(len(posts) / batch_size + 0.5))
-    shards = (posts.slice(i * batch_size, batch_size) for i in breaks)
-    stddev = posts["fav_count"].std()
-    for shard in shards:
+    for shard in posts.iter_slices(batch_size):
         batch = shard_batch(shard, tag_count)
         score = jax.device_get(jax.jit(forward.apply)(params, stddev, batch))
         shard = shard.with_columns(pl.Series(score).alias("fav_score"))
