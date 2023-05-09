@@ -2,7 +2,7 @@ today=`date --iso`
 exurl='https://e621.net/db_export/'
 yesterday=`date --iso -d yesterday`
 
-for asset in tags posts; do
+for asset in tags posts pools; do
     opath="$asset.csv"
     if [ ! -e "$opath" ]; then 
         curl "$exurl/$asset-$today.csv.gz" | gunzip > "$opath"
