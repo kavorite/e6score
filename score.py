@@ -37,16 +37,13 @@ class Batch(NamedTuple):
     up_score: jnp.ndarray
     down_score: jnp.ndarray
     comment_count: jnp.ndarray
-    is_deleted: jnp.ndarray
     id_tag: jnp.ndarray
 
 
 def preprocess(shard: pl.DataFrame):
-    return (
-        shard.with_columns(pl.col("tag_string").str.split(" ").alias("tags"))
-        .with_columns(pl.col("rating").cast(pl.Categorical).cast(pl.Int8))
-        .with_columns((pl.col("is_deleted") == "t").cast(float))
-    )
+    return shard.with_columns(
+        pl.col("tag_string").str.split(" ").alias("tags")
+    ).with_columns(pl.col("rating").cast(pl.Categorical).cast(pl.Int8))
 
 
 def shard_batch(shard: pl.DataFrame, topk: int, seed: Optional[int] = None):
@@ -109,29 +106,27 @@ def regressor(batch: Batch, dropout=0.1):
         z += embed(mueller_hash(index % embed.vocab_size)).mean(axis=-2)
     x = [
         batch.age,
-        batch.tag_count,
         batch.rating,
-        batch.is_deleted,
-        batch.comment_count,
-        batch.up_score,
-        batch.down_score,
+        # batch.tag_count,
+        # batch.comment_count,
+        # batch.up_score,
+        # batch.down_score,
     ]
     x = jnp.stack(x, axis=-1)
     r = jax.nn.one_hot(batch.rating, 3)
-    x = jnp.concatenate([x, r], axis=-1).astype(float)
-    x = hk.LayerNorm(-1, True, True)(x)
-    h = x + hk.LayerNorm(-1, True, True, scale_init=jnp.zeros)(DCN([16] * 4)(x))
     "https://arxiv.org/abs/1907.05321"
     t = jnp.sin(hk.Linear(width)(batch.age[..., None].astype(float)))
-
-    h = jnp.concatenate([z, x, t], axis=-1)
-    h = hk.dropout(next(rng), dropout, h) if rng is not None else h
+    x = jnp.concatenate([z, x, t, r], axis=-1)
+    x += hk.LayerNorm(-1, True, True, scale_init=jnp.zeros)(
+        DCN([16] * 4)(hk.dropout(next(rng), dropout, x) if rng is not None else x)
+    )
     y = hk.nets.MLP([512, 1024, 512, 2], activation=jax.nn.gelu)(
-        h,
+        x,
         dropout_rate=dropout if rng is not None else None,
         rng=next(rng) if rng is not None else None,
     )
-    shift, scale = map(jax.nn.softplus, y.swapaxes(0, -1))
+    shift, scale = y.swapaxes(0, -1)
+    scale = jax.nn.softplus(scale)
     return shift, scale
 
 
@@ -235,13 +230,11 @@ posts = (
     .with_columns(pl.col("created_at").fill_null(strategy="backward"))
     .with_columns(
         ((pl.col("created_at") - pl.date(2007, 2, 10)).dt.hours())
-        .cast(float)
         .alias("age")
+        .cast(float),
+        pl.col("up_score", "comment_count", "down_score", "fav_count").cast(float),
+        (pl.col("tag_string").str.count_match(" ") + 1).alias("tag_count").cast(float),
     )
-    .with_columns(
-        (pl.col("tag_string").str.count_match(" ") + 1).cast(float).alias("tag_count")
-    )
-    .with_columns(pl.col("fav_count").cast(float))
     .with_columns(
         (pl.col(pl.FLOAT_DTYPES) - pl.col(pl.FLOAT_DTYPES).median())
         / pl.col(pl.FLOAT_DTYPES).std()
@@ -286,11 +279,9 @@ else:
 
 @hk.without_apply_rng
 @hk.transform
-def forward(stddev: float, inputs: Batch):
+def forward(inputs: Batch):
     value = inputs.fav_count
     shift, scale = regressor(inputs)
-    # score = (value / stddev + shift / scale) / (1 / stddev + 1 / scale)
-    del stddev
     if objective is gaussian_nll:
         score = jax.scipy.stats.norm.cdf(value, shift, scale)
     else:
@@ -299,14 +290,15 @@ def forward(stddev: float, inputs: Batch):
     return score
 
 
-header = posts.columns + ["fav_score"]
-stddev = posts["fav_count"].std()
+header = ["id", "fav_score"]
 sys.stdout.buffer.write((",".join(header) + "\n").encode("utf8"))
 with rp.Progress(*columns, console=console, redirect_stdout=False) as pbar:
-    task = pbar.add_task("evaluating...", total=int(len(posts) / batch_size + 0.5))
+    task = pbar.add_task(
+        "evaluating...", total=np.ceil(len(posts) / batch_size).astype(int)
+    )
     for shard in posts.iter_slices(batch_size):
         batch = shard_batch(shard, tag_count)
-        score = jax.device_get(jax.jit(forward.apply)(params, stddev, batch))
+        score = jax.device_get(jax.jit(forward.apply)(params, batch))
         shard = shard.with_columns(pl.Series(score).alias("fav_score"))
         shard = shard.select(header)
         shard.write_csv(sys.stdout.buffer, has_header=False)
