@@ -281,7 +281,7 @@ else:
 @hk.transform
 def forward(inputs: Batch):
     value = inputs.fav_count
-    shift, scale = regressor(inputs)
+    shift, scale = regressor(inputs, dropout=0.0)
     if objective is gaussian_nll:
         score = jax.scipy.stats.norm.cdf(value, shift, scale)
     else:
