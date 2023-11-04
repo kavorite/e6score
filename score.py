@@ -3,14 +3,10 @@ import itertools as it
 import os
 import sys
 from typing import NamedTuple, Optional
+import orbax.checkpoint
 
-import msgpack
-import msgpack_numpy
-
-msgpack_numpy.patch()
-
-import haiku as hk
-import haiku.initializers as hki
+import flax.linen as nn
+from flax.training import orbax_utils
 import jax
 import jax.numpy as jnp
 import jax.random as jrd
@@ -18,12 +14,11 @@ import numpy as np
 import optax
 import polars as pl
 import rich.progress as rp
-
-jax.config.update("jax_debug_nans", True)
+import jax.tree_util as jtu
 
 tags = (
     pl.scan_csv("tags.csv")
-    .with_columns(pl.col("post_count").arg_sort())
+    .with_columns(pl.col("post_count").arg_sort().alias("id"))
     .filter(pl.col("post_count") > 0)
     .collect()
 )
@@ -52,11 +47,11 @@ def shard_batch(shard: pl.DataFrame, topk: int, seed: Optional[int] = None):
         shard.select(["tags", "id"])
         .explode("tags")
         .join(tags, left_on="tags", right_on="name", how="left", suffix="_tag")
-        .groupby("id")
+        .group_by("id")
     )
     shard = (
-        shard.join(joint.agg({"id_tag": "first"}), on="id")
-        .with_columns(pl.col("id_tag").arr.sort().arr.slice(0, topk))
+        shard.join(joint.agg(pl.col("id_tag")), on="id")
+        .with_columns(pl.col("id_tag").list.sort().list.slice(0, topk))
         .with_columns(pl.col("age").fill_null(strategy="forward"))
         .select(Batch._fields)
     )
@@ -68,164 +63,229 @@ def shard_batch(shard: pl.DataFrame, topk: int, seed: Optional[int] = None):
     return Batch(*shard.drop("id_tag").to_numpy().T.astype(float), tag_ids)
 
 
-class DCN(hk.Module):
+class DCN(nn.Module):
     "https://arxiv.org/abs/2008.13535"
+    ranks: list[int]
 
-    def __init__(self, ranks, name=None):
-        super().__init__(name=name)
-        self.ranks = ranks
-
+    @nn.compact
     def __call__(self, x):
         y = x
         for d in self.ranks:
-            U = hk.Linear(d)
-            Vt = hk.Linear(x.shape[-1])
+            U = nn.Dense(d)
+            Vt = nn.Dense(x.shape[-1])
             y += x * Vt(U(y))
         return y
 
 
-def regressor(batch: Batch, dropout=0.1):
-    def mueller_hash(x):
-        "https://stackoverflow.com/a/12996028"
-        x = ((x >> 16) ^ x) * 0x45D9F3B
-        x = ((x >> 16) ^ x) * 0x45D9F3B
-        x = (x >> 16) ^ x
-        return x
+class MLP(nn.Module):
+    ranks: list[int]
+    actfn: nn.activation = nn.gelu
 
-    rng = hk.maybe_next_rng_key()
-    if rng is not None:
-        rng = hk.PRNGSequence(rng)
-    width = 256
-    embed = hk.Embed(4096, width, w_init=hki.RandomNormal(width**-0.5))
-    index = batch.id_tag
-    z = jnp.zeros(batch.id_tag.shape[:-1] + (embed.embed_dim,))
-    for _ in range(4):
-        "https://arxiv.org/abs/1706.03993"
-        "https://explosion.ai/blog/bloom-embeddings"
-        index += embed.vocab_size
-        z += embed(mueller_hash(index % embed.vocab_size)).mean(axis=-2)
-    x = [
-        batch.age,
-        batch.rating,
-        # batch.tag_count,
-        # batch.comment_count,
-        # batch.up_score,
-        # batch.down_score,
+    @nn.compact
+    def __call__(self, x):
+        _act = self.actfn
+        y = x
+        for i, d in enumerate(self.ranks):
+            y = nn.Dense(d)(y)
+            if i != len(self.ranks) - 1:
+                y = _act(y)
+        return y
+
+
+class Regressor(nn.Module):
+    width: int = 256
+    vocab: int = 4096
+    dcn_ranks: tuple[int] = (16,) * 4
+    mlp_ranks: tuple[int] = (512, 68, 382)
+    emb_steps: int = 4
+
+    @nn.compact
+    def __call__(self, batch):
+        def mueller_hash(x):
+            "https://stackoverflow.com/a/12996028"
+            x = ((x >> 16) ^ x) * 0x45D9F3B
+            x = ((x >> 16) ^ x) * 0x45D9F3B
+            x = (x >> 16) ^ x
+            return x
+
+        width = self.width
+        embed = nn.Embed(self.vocab, width)
+        index = batch.id_tag
+        z = jnp.zeros(batch.id_tag.shape[:-1] + embed.embedding.shape[-1:])
+        for embed_step in range(self.emb_steps):
+            "https://arxiv.org/abs/1706.03993"
+            "https://explosion.ai/blog/bloom-embeddings"
+            index = mueller_hash(index)
+            if embed_step % 2 == 1:
+                index = ~index
+            codes = embed(index % embed.num_embeddings)
+            codes *= self.emb_steps**-0.5
+            codes *= codes.shape[-2] ** -0.5
+            codes = codes.sum(axis=-2)
+            z += codes
+
+        r = nn.Embed(3, width)(batch.rating.astype(int))
+        "https://arxiv.org/abs/1907.05321"
+        t = jnp.sin(nn.Dense(width)(batch.age[..., None].astype(float)))
+        x = jnp.concatenate([z, t, r], axis=-1)
+        x += DCN(self.dcn_ranks)(x)
+        y = MLP(self.mlp_ranks + (1,), actfn=jax.nn.gelu)(x)
+        y = y.squeeze(axis=-1)
+        return y
+
+
+def flatten(params):
+    arrays = jtu.tree_leaves(params)
+    assert all(a.dtype == arrays[0].dtype for a in arrays[1:])
+    return jnp.concatenate(
+        [param.reshape(-1) for param in jtu.tree_leaves(params)],
+        dtype=arrays[0].dtype,
+    )
+
+
+def unflatten(flat, updates):
+    updates_flat, treedef = jtu.tree_flatten(updates)
+    offsets = []
+    for update in updates_flat:
+        if offsets:
+            offsets.append(update.size + offsets[-1])
+        else:
+            offsets.append(update.size)
+    del offsets[-1]
+    flat_split = jnp.split(flat, offsets)
+    reshaped = [
+        jnp.reshape(flat_update, update.shape)
+        for flat_update, update in zip(flat_split, updates_flat)
     ]
-    x = jnp.stack(x, axis=-1)
-    r = jax.nn.one_hot(batch.rating, 3)
-    "https://arxiv.org/abs/1907.05321"
-    t = jnp.sin(hk.Linear(width)(batch.age[..., None].astype(float)))
-    x = jnp.concatenate([z, x, t, r], axis=-1)
-    x += hk.LayerNorm(-1, True, True, scale_init=jnp.zeros)(
-        DCN([16] * 4)(hk.dropout(next(rng), dropout, x) if rng is not None else x)
-    )
-    y = hk.nets.MLP([512, 1024, 512, 2], activation=jax.nn.gelu)(
-        x,
-        dropout_rate=dropout if rng is not None else None,
-        rng=next(rng) if rng is not None else None,
-    )
-    shift, scale = y.swapaxes(0, -1)
-    scale = jax.nn.softplus(scale)
-    return shift, scale
-
-
-@hk.transform
-def gaussian_nll(batch: Batch):
-    shift, scale = regressor(batch)
-    return -jnp.mean(jax.scipy.stats.norm.logpdf(batch.fav_count, shift, scale))
-
-
-@hk.transform
-def residual_err(batch: Batch):
-    shift, scale = regressor(batch)
-    del scale
-    return jnp.mean(jnp.abs(batch.fav_count - shift))
-
-
-@hk.transform
-def quantile_err(batch: Batch, q=0.32):
-    "https://hackmd.io/@cgarciae/quantile-regression"
-    shift, scale = regressor(batch)
-    del scale
-    r = batch.fav_count - shift
-    return jnp.maximum(q * r, (q - 1.0) * r).mean()
-
-
-class EMA(NamedTuple):
-    "https://blog.fugue88.ws/archives/2017-01/The-correct-way-to-start-an-Exponential-Moving-Average-EMA"
-    r: float
-    s: float
-    d: float
-
-    @classmethod
-    def init(cls, r):
-        return cls(r=r, s=0, d=1)
-
-    def update(self, x):
-        s = self.r * self.s + (1 - self.r) * x
-        d = self.r * self.d
-        s /= 1 - d
-        return self._replace(r=self.r, s=s, d=d)
-
-
-def optimizer(tsteps, rng, batch):
-    del rng, batch  # needed for SAM ascent step, but otherwise unnecessary
-    lsched = optax.linear_onecycle_schedule(tsteps, 3e-5)
-    msched = optax.linear_onecycle_schedule(
-        tsteps, 0.95, div_factor=0.95 / 0.85, final_div_factor=1
-    )
-    optim = optax.chain(
-        optax.adaptive_grad_clip(1e-3),
-        optax.inject_hyperparams(optax.scale_by_lion)(msched),
-        optax.additive_weight_decay(0.3),
-        optax.inject_hyperparams(optax.scale)(lsched),
-        optax.scale(-1),
-    )
-    return optax.lookahead(optim, 6, 0.5)
+    return jtu.tree_unflatten(treedef, reshaped)
 
 
 class TrainState(NamedTuple):
-    params: optax.LookaheadParams
-    opt_st: optax.OptState
-    loss: EMA
+    params: optax.Params
+    scales: jax.Array
+    moment: jax.Array
+    # opt_st: optax.OptState
+    err_st: optax.EmaState
+    loss: jax.Array
+    step: jax.Array
+    rng: jrd.PRNGKey
 
 
-def train_init(steps: int, rng: jrd.PRNGKey, batch: Batch):
-    params = hk.transform(regressor).init(rng, batch)
-    params = optax.LookaheadParams.init_synced(params)
-    opt_st = optimizer(steps, rng, batch).init(params)
-    return TrainState(params, opt_st, loss=EMA.init(0.9))
+@ft.partial(jax.jit, static_argnums=0, donate_argnums=1)
+def train_init(steps: int, rng: jrd.PRNGKey, inputs: Batch):
+    rng, key = jrd.split(rng)
+    params = Regressor().init(key, inputs)
+    # params["alpha"] = jnp.zeros([])
+    # opt_st = optimizer(steps).init(params)
+    scales = jnp.ones_like(flatten(params))
+    moment = jnp.zeros_like(scales)
+    loss = 0.0
+    err_st = optax.ema(0.9).init(loss)
+    step = 0
+    return TrainState(params, scales, moment, err_st, loss, step, rng)
 
 
-objective = gaussian_nll
+def quantile_err(params, inputs: Batch, q=0.99):
+    "https://hackmd.io/@cgarciae/quantile-regression"
+    r = inputs.fav_count - Regressor().apply(params, inputs)
+    return jnp.maximum(q * r, (q - 1.0) * r).mean()
+
+
+def objective(params, inputs):
+    y = inputs.fav_count
+    # alpha = params.pop("alpha")
+    y_hat = Regressor().apply(params, inputs)
+    r_err = optax.l2_loss(y, y_hat)
+    h_err = jnp.abs(y_hat.var() - jnp.ones_like(y_hat))
+    error = r_err.mean()
+    # error = (
+    #     jax.nn.sigmoid(alpha) * r_err.mean()
+    #     + (1 - jax.nn.sigmoid(alpha)) * h_err.mean()
+    # )
+    # params["alpha"] = alpha
+    return error
+
+
+# objective = quantile_err
+
+
+def optimizer(steps):
+    peak_lr = 1e-3
+    weight_decay = 0.01
+    lsched = optax.linear_onecycle_schedule(steps, peak_lr)
+    msched = lambda step: 0.85 + 0.1 * lsched(step) / peak_lr
+    optim = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.additive_weight_decay(weight_decay),
+        optax.inject_hyperparams(optax.scale_by_lion)(msched),
+        optax.inject_hyperparams(optax.scale)(lsched),
+    )
+    return optax.flatten(optim)
 
 
 @ft.partial(jax.jit, static_argnums=0)
-def train_step(steps, state: TrainState, rng: jrd.PRNGKey, batch: Batch):
-    grad = jax.grad(objective.apply)(state.params.fast, rng, batch)
-    "https://arxiv.org/abs/2102.11600"
-    ascent_stride = 1.0 / optax.global_norm(grad)
-    params = jax.tree_util.tree_map(
-        lambda w, dw: w + jnp.square(w) * dw * ascent_stride, state.params.fast, grad
+def train_step(steps, state: TrainState, inputs: Batch):
+    peak_lr = 1e-3
+    lsched = optax.linear_onecycle_schedule(steps, peak_lr)
+    msched = lambda step: 0.85 + 0.1 * lsched(step) / peak_lr
+    ascent_stride = 0.01
+    weight_decay = 0.00
+    scales_gamma = 1e-1
+    clipping_factor = 1.0
+    batch_size = inputs.fav_count.size
+    params = flatten(state.params)
+    rng, ascent_key = jrd.split(state.rng)
+    _unflatten = ft.partial(unflatten, updates=state.params)
+    ascent = jrd.normal(ascent_key, params.shape, dtype=params.dtype) * (
+        1 / jnp.sqrt(state.scales) / batch_size
     )
-    loss, grad = jax.value_and_grad(objective.apply)(params, rng, batch)
-    updates, opt_st = optimizer(steps, rng, batch).update(
-        grad, state.opt_st, state.params
+    grad = jax.grad(objective)(_unflatten(params + ascent), inputs)
+    grad = flatten(grad)
+    scales = state.scales
+    ascent = ascent_stride * grad / scales
+    scales = jnp.sqrt(scales) * jnp.abs(grad) + weight_decay + scales_gamma
+    scales = optax.update_moment(grad, scales, 0.99, order=1)
+    grad = jax.grad(objective)(_unflatten(params + ascent), inputs)
+    grad = flatten(grad)
+    loss, grad = jax.value_and_grad(objective)(_unflatten(params + ascent), inputs)
+    step = optax.safe_int32_increment(state.step)
+    # grad["alpha"] *= 0.01 / -lsched(step)
+    grad = flatten(grad)
+    grad /= optax.safe_norm(grad, 1e-5) * clipping_factor
+    moment = state.moment
+    moment = optax.update_moment(grad, moment, msched(state.step), order=1)
+    params -= (
+        lsched(step)
+        * optax.bias_correction(moment, msched(step), step)
+        / optax.bias_correction(scales, 0.99, step)
+        + weight_decay * params
     )
-    params = optax.apply_updates(state.params, updates)
-    loss = state.loss.update(loss)
-    return state._replace(params=params, opt_st=opt_st, loss=loss)
+    params = _unflatten(params)
+    loss, err_st = optax.ema(0.9).update(loss, state.err_st)
+    return state._replace(
+        params=params,
+        err_st=err_st,
+        moment=moment,
+        scales=scales,
+        step=step,
+        loss=loss,
+        rng=rng,
+    )
 
 
-ckpt_path = "params.msgpack"
+ckpt_path = "params.ckpt"
 post_path = "posts.csv"
-keys = hk.PRNGSequence(42)
 batch_size = 4096
-tag_count = 128
+tag_count = 32
 sys.stderr.write(f"read {post_path}...\n")
 posts = (
-    pl.scan_csv(post_path, try_parse_dates=True, low_memory=True)
+    pl.scan_csv(post_path)
+    .with_columns(
+        pl.col("^(created|updated)_at$")
+        .str.split(".")
+        .list.get(0)
+        .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")
+    )
     .filter(pl.col("is_deleted") == "f")
     .with_columns(pl.col("created_at").fill_null(strategy="backward"))
     .with_columns(
@@ -233,7 +293,9 @@ posts = (
         .alias("age")
         .cast(float),
         pl.col("up_score", "comment_count", "down_score", "fav_count").cast(float),
-        (pl.col("tag_string").str.count_match(" ") + 1).alias("tag_count").cast(float),
+        (pl.col("tag_string").str.count_matches(" ") + 1)
+        .alias("tag_count")
+        .cast(float),
     )
     .with_columns(
         (pl.col(pl.FLOAT_DTYPES) - pl.col(pl.FLOAT_DTYPES).median())
@@ -244,6 +306,7 @@ posts = (
 epochs = 1.0
 tsteps = np.ceil(epochs * len(posts) / batch_size).astype(int)
 breaks = np.arange(tsteps)
+ckpointer = orbax.checkpoint.PyTreeCheckpointer()
 batches = (
     shard_batch(posts.sample(batch_size, seed=seed), tag_count) for seed in it.count()
 )
@@ -255,10 +318,12 @@ columns = (
 )
 console = rp.Console(file=sys.stderr)
 if os.path.exists(ckpt_path):
-    with open(ckpt_path, "rb") as istrm:
-        params = msgpack.unpackb(istrm.read())
+    params = ckpointer.restore(ckpt_path)
 else:
-    tstate = train_init(tsteps, next(keys), next(batches))
+    rng = jrd.PRNGKey(42)
+    tstate = train_init(tsteps, rng, next(batches))
+    shards = jax.sharding.PositionalSharding(jax.local_devices())
+    tstate = jax.device_put(tstate, shards.replicate(0))
     with rp.Progress(
         "loss: {task.fields[loss]:.3g}", *columns, console=console
     ) as pbar:
@@ -268,38 +333,33 @@ else:
             total=tsteps,
             start=False,
         )
-        for rng, batch in zip(keys, batches):
+        for inputs in batches:
+            inputs = jtu.tree_map(
+                lambda a: jax.device_put(a, shards.reshape([-1] + [1] * (a.ndim - 1))),
+                inputs,
+            )
+            tstate = train_step(tsteps, tstate, inputs)
             pbar.start_task(task)
-            tstate = train_step(tsteps, tstate, rng, batch)
-            pbar.update(task, advance=1, loss=jax.device_get(tstate.loss.s))
-    params = jax.device_get(tstate.params.slow)
-    with open(ckpt_path, "wb+") as ostrm:
-        ostrm.write(msgpack.dumps(params))
-
-
-@hk.without_apply_rng
-@hk.transform
-def forward(inputs: Batch):
-    value = inputs.fav_count
-    shift, scale = regressor(inputs, dropout=0.0)
-    if objective is gaussian_nll:
-        score = jax.scipy.stats.norm.cdf(value, shift, scale)
-    else:
-        del scale
-        score = value - shift
-    return score
+            pbar.update(task, advance=1, loss=jax.device_get(tstate.loss))
+    params = jax.device_get(tstate.params)
+    ckpointer.save(
+        ckpt_path, params, save_args=orbax_utils.save_args_from_target(params)
+    )
 
 
 header = ["id", "fav_score"]
 sys.stdout.buffer.write((",".join(header) + "\n").encode("utf8"))
+stddev = posts.select(pl.col("fav_count").std())
 with rp.Progress(*columns, console=console, redirect_stdout=False) as pbar:
     task = pbar.add_task(
         "evaluating...", total=np.ceil(len(posts) / batch_size).astype(int)
     )
+    # alpha = params.pop("alpha")
     for shard in posts.iter_slices(batch_size):
-        batch = shard_batch(shard, tag_count)
-        score = jax.device_get(jax.jit(forward.apply)(params, batch))
-        shard = shard.with_columns(pl.Series(score).alias("fav_score"))
+        inputs = shard_batch(shard, tag_count)
+        value = jax.device_get(jax.jit(Regressor().apply)(params, inputs))
+        score = (inputs.fav_count - value) / stddev
+        shard = shard.with_columns(pl.Series("fav_score", value))
         shard = shard.select(header)
         shard.write_csv(sys.stdout.buffer, has_header=False)
         pbar.advance(task)
